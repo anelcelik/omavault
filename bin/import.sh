@@ -134,6 +134,15 @@ for id in "${catIds[@]}"; do
     [ -z "$src" ] && continue
     snapSrc="$snapDir/$rel"
     if [ "$kind" = "file" ]; then
+      # Rechecked here, not just in the whole-snapshot pass above: `cp`
+      # dereferences a symlink source by default, so if $snapSrc were
+      # swapped out for one in the window between that pass and this
+      # actual copy, `[ -f ]` below wouldn't catch it (it dereferences
+      # too) and `cp` would silently copy whatever it points to. Narrows
+      # that window to nothing by checking immediately before use.
+      if [ -L "$snapSrc" ]; then
+        fail "Backup rejected: \"$rel\" is a symlink -- refusing to restore."
+      fi
       [ -f "$snapSrc" ] || continue
       if [ -f "$src" ]; then
         mkdir -p "$(dirname "$backupDir/$rel")"
@@ -158,7 +167,11 @@ for id in "${catIds[@]}"; do
       # nothing but regular files/directories exist under $snapSrc -- this
       # is defense-in-depth so even a future bug in that check can't have
       # rsync faithfully recreate something it shouldn't; without -l/-D,
-      # rsync just skips any non-regular entry instead.
+      # this also closes the same TOCTOU window the recheck above closes
+      # for the "file" branch, but for free: rsync itself (not just our
+      # earlier pass) skips any non-regular entry at the moment it
+      # actually reads $snapSrc, so a swap-in right before this call is
+      # simply skipped rather than followed or recreated.
       rsyncFlags=(-r -p -t -g -o)
       [ -n "$extraExclude" ] && rsyncFlags+=($extraExclude)
       rsync "${rsyncFlags[@]}" "$snapSrc/" "$src/" 2>/dev/null

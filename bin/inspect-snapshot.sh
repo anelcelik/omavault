@@ -43,6 +43,22 @@ else
   checksumOk=false
 fi
 
+# ---- Same red flag import.sh enforces as a hard restore-time block: any
+# non-regular-file/non-directory entry (symlink, hardlink, device, FIFO,
+# ...) anywhere in the snapshot. `sha256sum -c` above dereferences
+# symlinks to compute their hash, so it would happily show green for a
+# symlink pointing at innocuous content -- without this, the badge (and
+# the restore button it gates in the UI) could say "verified" for a
+# snapshot import.sh is actually going to refuse outright.
+badEntries="[]"
+while IFS= read -r -d '' p; do
+  badEntries=$(jq --arg p "${p#"$dir"/}" '. + [$p]' <<<"$badEntries")
+done < <(find "$dir" -not -type f -not -type d -print0 2>/dev/null)
+if [ "$(jq 'length' <<<"$badEntries")" -gt 0 ]; then
+  checksumOk=false
+  failedFiles=$(jq -n --argjson a "$failedFiles" --argjson b "$badEntries" '$a + $b')
+fi
+
 jq -n \
   --slurpfile m "$manifest" \
   --argjson checksumOk "$checksumOk" \
