@@ -39,6 +39,8 @@ if ! tar -xf "$tmpDir/payload.tar" -C "$tmpDir"; then
   fail "Decrypted, but could not unpack the backup -- it may be corrupted."
 fi
 rm -f "$tmpDir/payload.tar"
-cp -p "$dir/manifest.json" "$tmpDir/manifest.json" 2>/dev/null
+# manifest.json comes out of the tar itself now -- every OmaVault backup is
+# fully encrypted, nothing (including manifest.json) is ever left plain
+# next to payload.tar.gpg to copy from.
 
 jq -n --arg tempDir "$tmpDir" '{ok:true, tempDir:$tempDir}'

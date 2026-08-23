@@ -2,9 +2,11 @@
 # Shared category registry + helpers for OmaVault's export/import scripts.
 # Every category maps one or more real config locations under $HOME to a
 # path inside a snapshot that mirrors it 1:1 (config/omarchy/..., dotfiles/
-# .bashrc, ...) -- a snapshot is just a browsable mini home directory, not a
-# bespoke archive format, so every file in it stays individually readable on
-# the USB stick with nothing to unpack.
+# .bashrc, ...) -- a snapshot is a browsable mini home directory, not a
+# bespoke archive format, so once decrypted every file in it stays
+# individually readable with nothing further to unpack. Nothing is ever
+# left in that mirrored, readable form on the USB stick itself, though --
+# export.sh always packs and encrypts it before anything touches disk.
 set -u
 
 HOME_DIR="${HOME:?HOME not set}"
@@ -27,7 +29,7 @@ BINARY_RSYNC_EXCLUDES=(
 # category that has at least one real source on this machine. Order here is
 # the order the GUI lists them in.
 list_category_meta() {
-  printf 'core\tOmarchy core settings\tBar layout, dock, search, themes, extensions and hooks under ~/.config/omarchy (the plugins/ subfolder is its own category below, so it is not duplicated here).\t1\n'
+  [ -d "$CONFIG_DIR/omarchy" ] && printf 'core\tOmarchy core settings\tBar layout, dock, search, themes, extensions and hooks under ~/.config/omarchy (the plugins/ subfolder is its own category below, so it is not duplicated here).\t1\n'
   [ -d "$CONFIG_DIR/omarchy/plugins" ] && printf 'plugins\tInstalled plugins\tEvery plugin under ~/.config/omarchy/plugins -- its settings plus its own source -- so a fresh machine can restore a plugin without re-fetching it from anywhere.\t1\n'
   [ -d "$CONFIG_DIR/hypr" ] && printf 'hypr\tHyprland\tWindow rules, keybindings, monitor layout and animations under ~/.config/hypr.\t1\n'
   local t label

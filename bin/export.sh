@@ -1,15 +1,16 @@
 #!/bin/bash
-# Usage: export.sh <comma-separated-category-ids> <destination-root> <new|latest> [encrypt]
+# Usage: export.sh <comma-separated-category-ids> <destination-root> <new|latest>
 # Copies the selected categories into <destination-root>/omavault/<snapshot>/
-# as a mirrored plain-text folder tree (see lib.sh's header), then writes
-# manifest.json + SHA256SUMS + README.txt and prints a JSON summary to stdout.
-#
-# If the 4th arg is the literal string "encrypt", a passphrase is read as
-# one line from stdin afterwards, and everything except manifest.json is
-# packed into payload.tar and symmetrically encrypted (gpg, AES256) as
-# payload.tar.gpg, with the plaintext originals then deleted -- manifest.json
-# stays plain so a stick can still be browsed (labels/file counts only, no
-# content) without the passphrase.
+# as a mirrored plain-text folder tree in a scratch dir (see lib.sh's
+# header), writes manifest.json + SHA256SUMS + README.txt, then ALWAYS
+# encrypts: a passphrase is read as one line from stdin (required -- fails
+# fast if none is given), and every one of those files, manifest.json
+# included, is packed into payload.tar and symmetrically encrypted (gpg,
+# AES256) as payload.tar.gpg. The plaintext scratch copy is then deleted,
+# leaving only payload.tar.gpg on disk -- nothing about a backup (contents,
+# category labels, even the source hostname) is readable without the
+# passphrase. There is no unencrypted-export mode: a lost/stolen backup
+# drive must not hand over anything readable.
 set -u
 cd "$(dirname "${BASH_SOURCE[0]}")" || exit 1
 . ./lib.sh
@@ -17,7 +18,6 @@ cd "$(dirname "${BASH_SOURCE[0]}")" || exit 1
 catsArg="${1:-}"
 destRoot="${2:-}"
 mode="${3:-new}"
-encryptFlag="${4:-}"
 
 fail() { jq -n --arg e "$1" '{ok:false, error:$e}'; exit 1; }
 
@@ -25,6 +25,13 @@ fail() { jq -n --arg e "$1" '{ok:false, error:$e}'; exit 1; }
 [ -n "$destRoot" ] || fail "No destination chosen."
 [ -d "$destRoot" ] || fail "Destination \"$destRoot\" does not exist or is not mounted."
 [ -w "$destRoot" ] || fail "Destination \"$destRoot\" is not writable."
+
+# Read the passphrase up front so a typo'd/empty one fails fast, before any
+# copying happens.
+IFS= read -r passphrase
+if [ -z "${passphrase:-}" ]; then
+  fail "A passphrase is required -- every OmaVault backup is encrypted, there is no plain-text export."
+fi
 
 vaultRoot="$destRoot/omavault"
 if [ "$mode" = "latest" ]; then
@@ -132,10 +139,13 @@ totalBytes=$(jq '[.[].bytes] | add // 0' <<<"$categoriesJson")
   echo "Host:     $(hostname)"
   echo "Mode:     $mode"
   echo
-  echo "This folder is a plain, uncompressed, unencrypted copy of the config"
-  echo "files listed below -- every file in here is exactly what it looks"
-  echo "like, individually readable, diffable and greppable. Nothing is"
-  echo "archived or hidden inside a bundled format."
+  echo "This backup is encrypted (AES-256 via gpg) -- decrypt it with the"
+  echo "passphrase it was created with, either through OmaVault's Import,"
+  echo "or by hand:"
+  echo "  gpg -d payload.tar.gpg | tar -x"
+  echo "Once decrypted, the files listed below are exactly what they look"
+  echo "like: individually readable, diffable and greppable, nothing hidden"
+  echo "inside a bespoke format beyond the one tar+gpg wrapping layer."
   echo
   echo "Layout mirrors your home directory:"
   echo "  config/omarchy/...   -> ~/.config/omarchy/..."
@@ -168,56 +178,42 @@ manifest=$(jq -n \
   --arg mode "$mode" \
   --argjson categories "$categoriesJson" \
   --argjson skippedCount "${#skippedList[@]}" \
-  '{schemaVersion: ($version|tonumber), tool:$tool, createdAt:$createdAt, hostname:$hostname, mode:$mode, categories:$categories, skippedBinaryCount:$skippedCount}')
+  '{schemaVersion: ($version|tonumber), tool:$tool, createdAt:$createdAt, hostname:$hostname, mode:$mode, categories:$categories, skippedBinaryCount:$skippedCount, encrypted:true}')
 echo "$manifest" > "$snapDir/manifest.json"
 
-# ---- Checksums, computed last so they cover README.txt and manifest.json
-# too -- relative paths, verifiable with plain `sha256sum -c` from anywhere,
-# no dependency on this plugin being installed. (Regenerated below, scoped
-# to exclude manifest.json, if this snapshot ends up encrypted.)
+# ---- Checksums cover every file about to be packed, including
+# manifest.json and README.txt -- relative paths, so `sha256sum -c` still
+# works by hand after a manual `gpg -d | tar -x`, no dependency on this
+# plugin being installed.
 ( cd "$snapDir" && find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum ) > "$snapDir/SHA256SUMS"
 
-encrypted=false
-if [ "$encryptFlag" = "encrypt" ]; then
-  IFS= read -r passphrase
-  if [ -z "${passphrase:-}" ]; then
-    fail "Encryption was requested but no passphrase was received."
-  fi
-
-  # manifest.json is the one file that stays plain outside the encrypted
-  # blob (so a stick can be browsed -- labels/counts only -- without the
-  # passphrase); recompute SHA256SUMS to match exactly what's about to be
-  # packed, or a post-decrypt check would fail on a manifest.json entry
-  # that was never extracted.
-  ( cd "$snapDir" && find . -type f ! -name SHA256SUMS ! -name manifest.json -print0 | sort -z | xargs -0 sha256sum ) > "$snapDir/SHA256SUMS"
-
-  # Built outside snapDir so tar isn't asked to archive its own in-progress
-  # output file (harmless but noisy: "archive cannot contain itself").
-  payloadTar=$(mktemp)
-  if ! ( cd "$snapDir" && tar --exclude=manifest.json -cf "$payloadTar" . ); then
-    rm -f "$payloadTar"
-    passphrase=""
-    fail "Could not package the backup for encryption."
-  fi
-
-  gpgErr=$(mktemp)
-  if ! printf '%s' "$passphrase" | gpg --batch --yes --passphrase-fd 0 --pinentry-mode loopback \
-      --symmetric --cipher-algo AES256 -o "$snapDir/payload.tar.gpg" "$payloadTar" 2>"$gpgErr"; then
-    errMsg=$(tail -n2 "$gpgErr" 2>/dev/null)
-    rm -f "$gpgErr" "$payloadTar" "$snapDir/payload.tar.gpg"
-    passphrase=""
-    fail "Encryption failed: ${errMsg:-gpg error}"
-  fi
-  rm -f "$gpgErr" "$payloadTar"
+# ---- Encrypt. There is no plain-text mode: everything built above,
+# manifest.json included, is packed and encrypted, then deleted from disk --
+# nothing about this backup (contents, file names, categories, even that it
+# came from this host) is readable without the passphrase. Built outside
+# snapDir so tar isn't asked to archive its own in-progress output file
+# (harmless but noisy: "archive cannot contain itself").
+payloadTar=$(mktemp)
+if ! ( cd "$snapDir" && tar -cf "$payloadTar" . ); then
+  rm -f "$payloadTar"
   passphrase=""
-
-  # Everything is now duplicated inside payload.tar.gpg -- drop the
-  # plaintext originals, keeping only manifest.json and the encrypted blob.
-  find "$snapDir" -mindepth 1 -maxdepth 1 ! -name manifest.json ! -name payload.tar.gpg -exec rm -rf {} +
-  manifest=$(jq '. + {encrypted:true}' <<<"$manifest")
-  echo "$manifest" > "$snapDir/manifest.json"
-  encrypted=true
+  fail "Could not package the backup for encryption."
 fi
+
+gpgErr=$(mktemp)
+if ! printf '%s' "$passphrase" | gpg --batch --yes --passphrase-fd 0 --pinentry-mode loopback \
+    --symmetric --cipher-algo AES256 -o "$snapDir/payload.tar.gpg" "$payloadTar" 2>"$gpgErr"; then
+  errMsg=$(tail -n2 "$gpgErr" 2>/dev/null)
+  rm -f "$gpgErr" "$payloadTar" "$snapDir/payload.tar.gpg"
+  passphrase=""
+  fail "Encryption failed: ${errMsg:-gpg error}"
+fi
+rm -f "$gpgErr" "$payloadTar"
+passphrase=""
+
+# Everything is now duplicated inside payload.tar.gpg -- drop every
+# plaintext original, keeping only the encrypted blob itself.
+find "$snapDir" -mindepth 1 -maxdepth 1 ! -name payload.tar.gpg -exec rm -rf {} +
 
 jq -n \
   --arg path "$snapDir" \
@@ -225,6 +221,5 @@ jq -n \
   --argjson totalFiles "$totalFiles" \
   --argjson totalBytes "$totalBytes" \
   --argjson skippedCount "${#skippedList[@]}" \
-  --argjson encrypted "$encrypted" \
   --argjson errors "$(printf '%s\n' "${errors[@]:-}" | jq -R . | jq -s 'map(select(length>0))')" \
-  '{ok:true, path:$path, categories:$categories, totalFiles:$totalFiles, totalBytes:$totalBytes, skippedBinaryCount:$skippedCount, encrypted:$encrypted, errors:$errors}'
+  '{ok:true, path:$path, categories:$categories, totalFiles:$totalFiles, totalBytes:$totalBytes, skippedBinaryCount:$skippedCount, encrypted:true, errors:$errors}'

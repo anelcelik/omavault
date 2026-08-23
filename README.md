@@ -16,24 +16,26 @@ and run `omarchy plugin enable io.github.anelcelik.omavault`.
 
 ## Design
 
-- **Plain text by default.** A backup is a mirrored copy of your real
-  config files (`config/omarchy/...`, `config/hypr/...`, `dotfiles/.bashrc`,
-  ...) -- nothing bundled, compressed, or hidden. Every file is individually
-  readable, diffable, and greppable straight off the stick. Non-text files
-  (icons, sqlite dbs, compiled caches) are left out automatically and
-  listed in the backup's own `README.txt`.
+- **Always encrypted -- no plain-text option.** Every export builds a
+  mirrored copy of your real config files (`config/omarchy/...`,
+  `config/hypr/...`, `dotfiles/.bashrc`, ...) in a scratch dir, then packs
+  the whole thing -- including `manifest.json` and `README.txt`, nothing
+  carved out -- into one `payload.tar.gpg` (AES-256 via `gpg --symmetric`)
+  and deletes the plaintext scratch copy. Nothing about a backup is
+  readable off the stick without the passphrase: not the file contents,
+  not the category labels, not even the source hostname. Non-text files
+  (icons, sqlite dbs, compiled caches) are left out automatically before
+  packing and listed in the backup's own (encrypted) `README.txt`. The
+  passphrase travels over each process's stdin, never argv or disk, and
+  isn't remembered anywhere -- there's no recovery if it's lost.
 - **Checksummed, not just copied.** Every export writes a `SHA256SUMS`
-  covering every file, plus a `manifest.json` describing what's in it.
-  Import verifies the whole thing before touching anything on this machine,
-  and refuses to restore if a checksum fails.
+  covering every file (manifest.json included) before encrypting. Import
+  decrypts, verifies the whole thing before touching anything on this
+  machine, and refuses to restore if a checksum fails.
 - **Non-destructive restore.** Anything an import is about to overwrite is
   copied first to `~/.local/state/omavault/pre-restore-<timestamp>/`.
   Restoring only adds/overwrites -- it never deletes existing files.
-- **Optional password encryption.** A toggle in Export wraps everything
-  except the small browsable `manifest.json` into one `payload.tar.gpg`
-  (AES-256 via `gpg --symmetric`). The passphrase travels over each
-  process's stdin, never argv or disk, and isn't remembered anywhere --
-  there's no recovery if it's lost. Decrypting for Import happens into a
+- **Decryption happens in memory, not on disk.** Import decrypts into a
   tmpfs temp dir (`$XDG_RUNTIME_DIR`, never the disk or the stick), wiped
   again once the popup closes or the restore attempt finishes.
 - **You choose what's included, every time.** The Export tab lists every
@@ -52,7 +54,7 @@ bin/lib.sh                Category registry (source→snapshot path map) + share
 bin/list-categories.sh    What's exportable on this machine, with live file counts
 bin/list-drives.sh        Detected removable drives + any OmaVault snapshots already on them
 bin/list-dir.sh           Powers the in-popup folder browser
-bin/export.sh             Builds a snapshot; `... encrypt` + a stdin passphrase encrypts it
+bin/export.sh             Builds a snapshot and encrypts it (stdin passphrase, required)
 bin/inspect-snapshot.sh   Reads manifest.json + verifies SHA256SUMS, without touching the machine
 bin/decrypt-snapshot.sh   Decrypts payload.tar.gpg into a tmpfs temp dir (stdin passphrase)
 bin/cleanup-temp.sh       Removes a decrypt-snapshot.sh temp dir

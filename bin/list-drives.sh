@@ -33,8 +33,17 @@ while IFS= read -r drive; do
       name=$(basename "$d")
       manifest="$d/manifest.json"
       if [ -f "$manifest" ] && jq -e . "$manifest" >/dev/null 2>&1; then
+        # A plaintext manifest.json only exists for a pre-mandatory-
+        # encryption legacy snapshot (or mid-decrypt tempDir, never scanned
+        # here) -- still importable, so still worth showing real labels for.
         summary=$(jq -c --arg path "${d%/}" --arg name "$name" \
           '{name:$name, path:$path, createdAt:(.createdAt // ""), hostname:(.hostname // ""), categories:[.categories[]?.label], encrypted:(.encrypted // false)}' "$manifest")
+      elif [ -f "$d/payload.tar.gpg" ]; then
+        # The normal case now: fully encrypted, nothing readable pre-decrypt
+        # -- not even labels/counts/hostname. Only the folder name (which is
+        # just a timestamp or "latest") is shown until it's unlocked.
+        summary=$(jq -cn --arg path "${d%/}" --arg name "$name" \
+          '{name:$name, path:$path, createdAt:"", hostname:"", categories:[], encrypted:true, locked:true}')
       else
         summary=$(jq -cn --arg path "${d%/}" --arg name "$name" '{name:$name, path:$path, createdAt:"", hostname:"", categories:[], noManifest:true}')
       fi

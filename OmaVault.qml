@@ -7,9 +7,10 @@ import qs.Ui
 
 // OmaVault: back up this machine's Omarchy setup (bar/dock/search/theme
 // settings, installed plugins, Hyprland config, terminal configs, optional
-// dotfiles) to a folder tree -- typically a USB stick -- as plain,
-// uncompressed, unencrypted files, then restore that same tree onto a
-// fresh Omarchy install. All the real work (scanning, copying, checksums)
+// dotfiles) to a folder tree -- typically a USB stick -- as a single
+// AES-256 encrypted, password-required payload.tar.gpg (no plain-text
+// export exists), then restore that same tree onto a fresh Omarchy
+// install. All the real work (scanning, copying, checksums, encryption)
 // happens in bin/*.sh; this file is just the bar chip + popup UI that
 // drives those scripts and renders their JSON output. See bin/lib.sh for
 // the category registry shared by every script.
@@ -36,7 +37,6 @@ BarWidget {
   property bool exporting: false
   property var exportResult: null
   property string exportError: ""
-  property bool exportEncrypt: false
   property string exportPassphrase: ""
   property string exportPassphraseConfirm: ""
 
@@ -189,7 +189,7 @@ BarWidget {
   }
 
   function isImportLocked() {
-    return !!(root.importInspect && root.importInspect.manifest && root.importInspect.manifest.encrypted) && !root.importUnlocked
+    return !!(root.importInspect && root.importInspect.locked) && !root.importUnlocked
   }
 
   function isImportCategoryOn(id) {
@@ -256,7 +256,6 @@ BarWidget {
   }
 
   function exportPassphraseValid() {
-    if (!root.exportEncrypt) return true
     return root.exportPassphrase.length > 0 && root.exportPassphrase === root.exportPassphraseConfirm
   }
 
@@ -268,13 +267,11 @@ BarWidget {
     root.exportResult = null
     root.exportError = ""
     root.exporting = true
-    var args = ["bash", root.binDir + "/export.sh", ids.join(","), dest, root.exportMode]
-    if (root.exportEncrypt) args.push("encrypt")
-    exportProc.command = args
+    exportProc.command = ["bash", root.binDir + "/export.sh", ids.join(","), dest, root.exportMode]
     // Passphrase goes over stdin, never argv -- see exportProc's
     // stdinEnabled/onStarted below. Cleared from QML state the instant
     // it's handed off so it isn't sitting in a property afterwards.
-    exportProc.pendingPassphrase = root.exportEncrypt ? root.exportPassphrase : ""
+    exportProc.pendingPassphrase = root.exportPassphrase
     root.exportPassphrase = ""
     root.exportPassphraseConfirm = ""
     exportProc.running = true
@@ -287,7 +284,6 @@ BarWidget {
       if (result.ok) {
         root.exportResult = result
         root.exportError = ""
-        root.exportEncrypt = false
         root.refreshDrives()
       } else {
         root.exportResult = null
@@ -335,10 +331,9 @@ BarWidget {
         return
       }
       root.importInspect = result
-      var locked = !!(result.manifest && result.manifest.encrypted) && !root.importUnlocked
-      if (locked) {
-        // Categories/labels are still visible (they're in the plain outer
-        // manifest.json), but checksum/restore wait for the passphrase.
+      if (result.locked) {
+        // Every backup is fully encrypted -- nothing is readable yet, not
+        // even labels/counts, until doUnlock() decrypts it.
         return
       }
       root.importWorkingPath = root.importWorkingPath || root.importSourcePath
@@ -526,8 +521,8 @@ BarWidget {
           Text {
             width: parent.width
             text: root.activeTab === "export"
-              ? "Copies the config files you pick into a plain folder tree -- no compression, no encryption, every file stays individually readable. Nothing is written until you press Export."
-              : "Reads a backup made by OmaVault (checksummed first) and copies its files back into place. Anything about to be overwritten is saved first, so nothing existing is ever lost."
+              ? "Copies the config files you pick into an AES-256 encrypted backup -- a password is required every time, there is no plain-text option. Nothing is written until you press Export."
+              : "Reads a backup made by OmaVault (decrypted, then checksummed) and copies its files back into place. Anything about to be overwritten is saved first, so nothing existing is ever lost."
             color: Qt.darker(root.popupForeground(), 1.4)
             font.family: Style.font.family
             font.pixelSize: Style.font.caption
@@ -659,22 +654,20 @@ BarWidget {
             }
 
             PanelSeparator { foreground: root.popupForeground() }
+            PanelSectionHeader { text: "PASSWORD (REQUIRED)"; foreground: root.popupForeground() }
 
-            Toggle {
+            Text {
               width: parent.width
-              label: "Encrypt this backup with a password"
-              description: "AES-256 via gpg. Off by default -- see the note above about staying plain text. The passphrase is never written to disk or shown in the process list, and isn't remembered anywhere."
-              checked: root.exportEncrypt
-              foreground: root.popupForeground()
-              titleSize: Style.font.caption
-              descriptionSize: Style.font.caption
-              onClicked: root.exportEncrypt = !root.exportEncrypt
+              text: "Every backup is encrypted with AES-256 via gpg -- there is no plain-text option. The passphrase is never written to disk or shown in the process list, and isn't remembered anywhere."
+              color: Qt.darker(root.popupForeground(), 1.4)
+              font.family: Style.font.family
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
             }
 
             Column {
               width: parent.width
               spacing: Style.space(6)
-              visible: root.exportEncrypt
 
               TextField {
                 width: parent.width

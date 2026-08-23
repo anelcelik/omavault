@@ -67,7 +67,7 @@ for id in "${catIds[@]}"; do
   label="${catLabel[$id]:-$id}"
   files=0
   case "$id" in core|plugins|hypr) needsRestart=true ;; esac
-  while IFS=$'\t' read -r src rel kind _ex; do
+  while IFS=$'\t' read -r src rel kind extraExclude; do
     [ -z "$src" ] && continue
     snapSrc="$snapDir/$rel"
     if [ "$kind" = "file" ]; then
@@ -85,7 +85,14 @@ for id in "${catIds[@]}"; do
         cp -a -- "$src" "$backupDir/$rel"
       fi
       mkdir -p "$src"
-      rsync -a "$snapSrc/" "$src/" 2>/dev/null
+      # Same extraExclude as export.sh (e.g. "core" excluding its nested
+      # /plugins subfolder) -- without this, restoring "core" alone would
+      # also drag in files that only belong to a separate category the
+      # user may not have selected (they're physically nested in the
+      # snapshot when both categories were exported together).
+      rsyncFlags=(-a)
+      [ -n "$extraExclude" ] && rsyncFlags+=($extraExclude)
+      rsync "${rsyncFlags[@]}" "$snapSrc/" "$src/" 2>/dev/null
       files=$((files + $(find "$snapSrc" -type f | wc -l)))
     fi
   done < <(category_entries "$id")
