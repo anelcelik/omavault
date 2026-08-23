@@ -59,9 +59,18 @@ for id in "${catIds[@]}"; do
       projectedBytes=$((projectedBytes + $(stat -c%s -- "$src" 2>/dev/null || echo 0)))
     else
       [ -d "$src" ] || continue
-      stats=$(rsync -a --dry-run --stats "${BINARY_RSYNC_EXCLUDES[@]}" $extraExclude "$src/" /tmp/omavault-count-target-unused/ 2>/dev/null)
+      # Fail closed, not open, if this dry-run can't be trusted: a failed
+      # rsync or an unparseable stats line falling back to "0 bytes"
+      # would let an actually-oversized category slip straight through
+      # this gate instead of being caught by it.
+      if ! stats=$(rsync -a --dry-run --stats "${BINARY_RSYNC_EXCLUDES[@]}" $extraExclude "$src/" /tmp/omavault-count-target-unused/ 2>/dev/null); then
+        fail "Could not estimate the size of \"$rel\" -- refusing to export without a reliable size check."
+      fi
       b=$(awk -F': ' '/Total transferred file size/ {gsub(/[, bytes]/,"",$2); print $2}' <<<"$stats")
-      projectedBytes=$((projectedBytes + ${b:-0}))
+      case "$b" in
+        ''|*[!0-9]*) fail "Could not estimate the size of \"$rel\" -- refusing to export without a reliable size check." ;;
+      esac
+      projectedBytes=$((projectedBytes + b))
     fi
   done < <(category_entries "$id")
 done
