@@ -50,8 +50,7 @@ passphrase=""
 # being tampered with and put back, say) shouldn't be able to make
 # extraction itself misbehave. The checksum pass in import.sh afterward
 # covers file *content*; this covers the archive *structure*: no member
-# path allowed to escape tmpDir (absolute paths or ".." segments), and a
-# sanity size cap since real config backups are KB-MB, not GB.
+# path allowed to escape tmpDir (absolute paths or ".." segments).
 while IFS= read -r entry; do
   case "$entry" in
     /*|*/../*|../*|..)
@@ -60,11 +59,30 @@ while IFS= read -r entry; do
   esac
 done < <(tar -tf "$tmpDir/.payload.tar" 2>/dev/null)
 
-# Belt-and-suspenders on top of the ulimit above: the ulimit already
+# ---- Type-check every member: only plain files and directories are ever
+# allowed through to extraction. A symlink, hardlink, device or FIFO
+# member is rejected outright (archive-wide, not just skipped) -- a
+# symlink's own path can pass the traversal check above while its
+# *target* still points outside tmpDir, and import.sh's checksum pass
+# only walks `find -type f`, so a symlink would never get content-
+# verified before being faithfully recreated at restore time. tar -tv's
+# first column is a permission/type string whose first character names
+# the type (`-` regular, `d` directory, `l` symlink, `h` hardlink, `c`/`b`
+# device, `p` FIFO, `s` socket) -- checked as a raw substring so it's
+# unaffected by spaces in filenames. Combined with the same pass's size
+# tally as belt-and-suspenders on top of the ulimit above (which already
 # bounds .payload.tar itself to MAX_BACKUP_BYTES, so this can only ever
-# trip on a malformed/inconsistent tar (it doesn't rely on the ulimit
-# having fired correctly).
-totalBytes=$(tar -tvf "$tmpDir/.payload.tar" 2>/dev/null | awk '{s+=$3} END{print s+0}')
+# trip on a malformed/inconsistent tar).
+totalBytes=0
+while IFS= read -r line; do
+  [ -z "$line" ] && continue
+  case "${line:0:1}" in
+    -|d) ;;
+    *) fail "Backup rejected: archive contains a disallowed entry type (\"$line\")." ;;
+  esac
+  size=$(awk '{print $3}' <<<"$line")
+  totalBytes=$((totalBytes + ${size:-0}))
+done < <(tar -tvf "$tmpDir/.payload.tar" 2>/dev/null)
 if [ "$totalBytes" -gt "$MAX_BACKUP_BYTES" ]; then
   fail "Backup rejected: archive is implausibly large ($totalBytes bytes) for a config backup."
 fi

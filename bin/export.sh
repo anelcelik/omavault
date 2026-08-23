@@ -37,6 +37,38 @@ if [ -z "${passphrase:-}" ]; then
   fail "A passphrase is required -- every OmaVault backup is encrypted, there is no plain-text export."
 fi
 
+IFS=',' read -r -a catIds <<<"$catsArg"
+declare -A catLabel
+while IFS=$'\t' read -r id label _desc _def; do catLabel["$id"]="$label"; done < <(list_category_meta)
+
+# ---- Bound the total size of what's about to be staged into tmpfs,
+# before any of it is actually copied there -- not just checked
+# afterward. Unlike the decrypt path there's no attacker-controlled
+# compression amplification here (this reads real local files 1:1), so a
+# cheap read-only dry-run scan is enough: nothing gets written until this
+# passes. Mirrors list-categories.sh's estimate technique (same dry-run
+# rsync --stats trick, same name-based excludes) so the number checked
+# here matches what a real export would actually try to copy.
+projectedBytes=0
+for id in "${catIds[@]}"; do
+  [ -n "$id" ] || continue
+  while IFS=$'\t' read -r src rel kind extraExclude; do
+    [ -z "$src" ] && continue
+    if [ "$kind" = "file" ]; then
+      [ -f "$src" ] || continue
+      projectedBytes=$((projectedBytes + $(stat -c%s -- "$src" 2>/dev/null || echo 0)))
+    else
+      [ -d "$src" ] || continue
+      stats=$(rsync -a --dry-run --stats "${BINARY_RSYNC_EXCLUDES[@]}" $extraExclude "$src/" /tmp/omavault-count-target-unused/ 2>/dev/null)
+      b=$(awk -F': ' '/Total transferred file size/ {gsub(/[, bytes]/,"",$2); print $2}' <<<"$stats")
+      projectedBytes=$((projectedBytes + ${b:-0}))
+    fi
+  done < <(category_entries "$id")
+done
+if [ "$projectedBytes" -gt "$MAX_BACKUP_BYTES" ]; then
+  fail "Selected categories total $projectedBytes bytes, over the $((MAX_BACKUP_BYTES / 1024 / 1024)) MiB limit for a config backup -- deselect some categories."
+fi
+
 # ---- Private tmpfs scratch dir. Everything plaintext lives only here,
 # never on the destination. mode 700, and removed on every exit path via
 # the trap below -- including a mid-run failure, so a botched export can't
@@ -57,10 +89,6 @@ else
   snapName="snapshot-$(date +%Y%m%d_%H%M%S)"
 fi
 finalDir="$vaultRoot/$snapName"
-
-IFS=',' read -r -a catIds <<<"$catsArg"
-declare -A catLabel
-while IFS=$'\t' read -r id label _desc _def; do catLabel["$id"]="$label"; done < <(list_category_meta)
 
 categoriesJson="[]"
 skippedList=()
@@ -91,7 +119,14 @@ for id in "${catIds[@]}"; do
       fi
     else
       mkdir -p "$target"
-      rsyncFlags=(-a "${BINARY_RSYNC_EXCLUDES[@]}")
+      # --copy-links: dereference any symlink in the live tree into its
+      # real target content, rather than preserving it as a symlink.
+      # decrypt-snapshot.sh now rejects a whole backup outright if it
+      # contains any symlink member, so without this, a perfectly normal
+      # symlinked dotfile setup (e.g. stow-managed configs) would silently
+      # produce a backup that's entirely useless the moment someone tries
+      # to restore it -- the worst possible time to find out.
+      rsyncFlags=(-a --copy-links "${BINARY_RSYNC_EXCLUDES[@]}")
       [ -n "$extraExclude" ] && rsyncFlags+=($extraExclude)
       [ "$mode" = "latest" ] && rsyncFlags+=(--delete)
       if ! rsync "${rsyncFlags[@]}" "$src/" "$target/" 2>"$rsyncErrFile"; then

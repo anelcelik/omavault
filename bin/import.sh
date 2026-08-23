@@ -25,6 +25,38 @@ IFS=',' read -r -a catIds <<<"$catsArg"
 declare -A catLabel
 while IFS=$'\t' read -r id label; do catLabel["$id"]="$label"; done < <(jq -r '.categories[]? | "\(.id)\t\(.label)"' "$snapDir/manifest.json" 2>/dev/null)
 
+# ---- Reject any non-regular-file/non-directory entry within what we're
+# about to restore, before any checksum work or copying happens. Type
+# validation of the tar itself (decrypt-snapshot.sh) already blocks this
+# for a normal encrypted backup, but a legacy pre-mandatory-encryption
+# plain snapshot folder never goes through that tar check -- and either
+# way, this is the actual restore boundary, so it's enforced here
+# regardless of how the snapshot got onto disk. Without this, a symlink
+# would skip checksum verification entirely (`find -type f` below doesn't
+# match `-type l`) and then get faithfully recreated by rsync, or -- for
+# a "file"-kind single dotfile, since `[ -f ]`/`cp` both dereference by
+# default -- have some arbitrary target's content silently copied in as
+# if it were that dotfile. `-L` is checked first (before any `-f`/`-d`
+# test, which would dereference) so this also catches a dangling symlink
+# and a top-level category entry that is itself a symlink.
+for id in "${catIds[@]}"; do
+  [ -n "$id" ] || continue
+  while IFS=$'\t' read -r src rel kind _ex; do
+    [ -z "$rel" ] && continue
+    p="$snapDir/$rel"
+    [ -e "$p" ] || [ -L "$p" ] || continue
+    if [ -L "$p" ]; then
+      fail "Backup rejected: \"$rel\" is a symlink -- refusing to restore."
+    fi
+    if [ "$kind" != "file" ] && [ -d "$p" ]; then
+      bad=$(find "$p" -not -type f -not -type d 2>/dev/null | head -n1)
+      if [ -n "$bad" ]; then
+        fail "Backup rejected: \"${bad#"$snapDir"/}\" is not a regular file or directory -- refusing to restore."
+      fi
+    fi
+  done < <(category_entries "$id")
+done
+
 # ---- Scope checksum verification to just the files we're about to touch.
 relFiles=()
 for id in "${catIds[@]}"; do
@@ -121,7 +153,13 @@ for id in "${catIds[@]}"; do
       # also drag in files that only belong to a separate category the
       # user may not have selected (they're physically nested in the
       # snapshot when both categories were exported together).
-      rsyncFlags=(-a)
+      # -rptgo, not -a: -a implies -l (preserve symlinks as symlinks) and
+      # -D (devices/specials). The type-check above already guarantees
+      # nothing but regular files/directories exist under $snapSrc -- this
+      # is defense-in-depth so even a future bug in that check can't have
+      # rsync faithfully recreate something it shouldn't; without -l/-D,
+      # rsync just skips any non-regular entry instead.
+      rsyncFlags=(-r -p -t -g -o)
       [ -n "$extraExclude" ] && rsyncFlags+=($extraExclude)
       rsync "${rsyncFlags[@]}" "$snapSrc/" "$src/" 2>/dev/null
       files=$((files + $(find "$snapSrc" -type f | wc -l)))
