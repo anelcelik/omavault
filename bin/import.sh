@@ -41,18 +41,49 @@ for id in "${catIds[@]}"; do
   done < <(category_entries "$id")
 done
 
-if [ "${#relFiles[@]}" -gt 0 ] && [ -f "$snapDir/SHA256SUMS" ]; then
-  badFiles=()
-  while IFS= read -r rel; do
-    line=$(grep -F "  ./$rel" "$snapDir/SHA256SUMS" 2>/dev/null || grep -F " ./$rel" "$snapDir/SHA256SUMS" 2>/dev/null)
+if [ "${#relFiles[@]}" -gt 0 ]; then
+  [ -f "$snapDir/SHA256SUMS" ] || fail "No SHA256SUMS in this backup -- refusing to restore unverified files."
+
+  # Exact path -> hash map, built once, instead of grepping SHA256SUMS per
+  # file. A plain `grep -F "  ./$rel"` (the previous approach) is an
+  # unanchored substring match -- "config/foo.conf" matches as a substring
+  # of a line for "config/foo.conf.bak" too, so a shorter selected path
+  # could silently "pass" against a longer, unrelated file's checksum.
+  # Requiring exactly one exact-path match per file closes that, and also
+  # means a file with NO entry at all is a verification failure, not a
+  # silent skip that still gets restored.
+  declare -A sumFor sumCount
+  while IFS= read -r line; do
     [ -z "$line" ] && continue
-    if ! ( cd "$snapDir" && echo "$line" | sha256sum -c --quiet - >/dev/null 2>&1 ); then
+    hash="${line%% *}"
+    rest="${line#"$hash"}"
+    rest="${rest# }"
+    rest="${rest# }"
+    rest="${rest#\*}"
+    [ -z "$rest" ] && continue
+    sumFor["$rest"]="$hash"
+    sumCount["$rest"]=$(( ${sumCount["$rest"]:-0} + 1 ))
+  done < "$snapDir/SHA256SUMS"
+
+  badFiles=()
+  for rel in "${relFiles[@]}"; do
+    key="./$rel"
+    cnt="${sumCount[$key]:-0}"
+    if [ "$cnt" != "1" ]; then
+      # 0 = no checksum entry for this file at all; >1 = duplicate/
+      # conflicting entries for the same path. Both are refused rather
+      # than guessed at.
+      badFiles+=("$rel")
+      continue
+    fi
+    actual=$(cd "$snapDir" && sha256sum -- "$rel" 2>/dev/null | awk '{print $1}')
+    if [ "$actual" != "${sumFor[$key]}" ]; then
       badFiles+=("$rel")
     fi
-  done < <(printf '%s\n' "${relFiles[@]}")
+  done
   if [ "${#badFiles[@]}" -gt 0 ]; then
     jq -n --argjson f "$(printf '%s\n' "${badFiles[@]}" | jq -R . | jq -s .)" \
-      '{ok:false, error:"Checksum mismatch -- refusing to restore. The stick may be corrupted or the file was edited by hand.", failedFiles:$f}'
+      '{ok:false, error:"Checksum mismatch (or missing/duplicate checksum entry) -- refusing to restore. The stick may be corrupted or the file was edited by hand.", failedFiles:$f}'
     exit 1
   fi
 fi

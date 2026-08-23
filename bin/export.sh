@@ -1,16 +1,20 @@
 #!/bin/bash
 # Usage: export.sh <comma-separated-category-ids> <destination-root> <new|latest>
-# Copies the selected categories into <destination-root>/omavault/<snapshot>/
-# as a mirrored plain-text folder tree in a scratch dir (see lib.sh's
-# header), writes manifest.json + SHA256SUMS + README.txt, then ALWAYS
-# encrypts: a passphrase is read as one line from stdin (required -- fails
-# fast if none is given), and every one of those files, manifest.json
-# included, is packed into payload.tar and symmetrically encrypted (gpg,
-# AES256) as payload.tar.gpg. The plaintext scratch copy is then deleted,
-# leaving only payload.tar.gpg on disk -- nothing about a backup (contents,
-# category labels, even the source hostname) is readable without the
-# passphrase. There is no unencrypted-export mode: a lost/stolen backup
-# drive must not hand over anything readable.
+# Copies the selected categories into a private tmpfs scratch dir as a
+# mirrored plain-text folder tree (see lib.sh's header), writes
+# manifest.json + SHA256SUMS + README.txt there, then ALWAYS encrypts: a
+# passphrase is read as one line from stdin (required -- fails fast if
+# none is given), and every one of those files, manifest.json included, is
+# packed into payload.tar and symmetrically encrypted (gpg, AES256) as
+# payload.tar.gpg. Only that encrypted blob is ever written to
+# <destination-root>/omavault/<snapshot>/ -- the plaintext scratch dir is
+# built and torn down entirely under $XDG_RUNTIME_DIR (RAM-backed tmpfs,
+# never the destination or a disk-backed tmp), and is removed via a trap
+# on every exit path, success or failure, so a mid-run error can't leave
+# plaintext behind either in the scratch dir or on the destination. There
+# is no unencrypted-export mode: a lost/stolen backup drive must never see
+# plaintext at any point, not even transiently -- deleting a file after
+# writing it to real (especially flash) media does not reliably erase it.
 set -u
 cd "$(dirname "${BASH_SOURCE[0]}")" || exit 1
 . ./lib.sh
@@ -33,14 +37,23 @@ if [ -z "${passphrase:-}" ]; then
   fail "A passphrase is required -- every OmaVault backup is encrypted, there is no plain-text export."
 fi
 
+# ---- Private tmpfs scratch dir. Everything plaintext lives only here,
+# never on the destination. mode 700, and removed on every exit path via
+# the trap below -- including a mid-run failure, so a botched export can't
+# leave plaintext sitting around either here or (since we never write
+# there until the very end) on the destination.
+scratchBase="${XDG_RUNTIME_DIR:-/tmp}"
+snapDir=$(mktemp -d "$scratchBase/omavault-export-XXXXXX") || fail "Could not create a private scratch directory."
+chmod 700 "$snapDir"
+trap 'passphrase=""; rm -rf "$snapDir"' EXIT
+
 vaultRoot="$destRoot/omavault"
 if [ "$mode" = "latest" ]; then
   snapName="latest"
 else
   snapName="snapshot-$(date +%Y%m%d_%H%M%S)"
 fi
-snapDir="$vaultRoot/$snapName"
-mkdir -p "$snapDir" || fail "Could not create $snapDir"
+finalDir="$vaultRoot/$snapName"
 
 IFS=',' read -r -a catIds <<<"$catsArg"
 declare -A catLabel
@@ -49,6 +62,7 @@ while IFS=$'\t' read -r id label _desc _def; do catLabel["$id"]="$label"; done <
 categoriesJson="[]"
 skippedList=()
 errors=()
+rsyncErrFile="$snapDir/.rsync-err"
 
 for id in "${catIds[@]}"; do
   [ -n "$id" ] || continue
@@ -77,10 +91,10 @@ for id in "${catIds[@]}"; do
       rsyncFlags=(-a "${BINARY_RSYNC_EXCLUDES[@]}")
       [ -n "$extraExclude" ] && rsyncFlags+=($extraExclude)
       [ "$mode" = "latest" ] && rsyncFlags+=(--delete)
-      if ! rsync "${rsyncFlags[@]}" "$src/" "$target/" 2>/tmp/omavault-rsync-err.$$; then
-        errors+=("$label: rsync failed -- $(cat /tmp/omavault-rsync-err.$$ 2>/dev/null | tail -n1)")
+      if ! rsync "${rsyncFlags[@]}" "$src/" "$target/" 2>"$rsyncErrFile"; then
+        errors+=("$label: rsync failed -- $(cat "$rsyncErrFile" 2>/dev/null | tail -n1)")
       fi
-      rm -f /tmp/omavault-rsync-err.$$
+      rm -f "$rsyncErrFile"
     fi
   done < <(category_entries "$id")
 
@@ -187,36 +201,33 @@ echo "$manifest" > "$snapDir/manifest.json"
 # plugin being installed.
 ( cd "$snapDir" && find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum ) > "$snapDir/SHA256SUMS"
 
-# ---- Encrypt. There is no plain-text mode: everything built above,
-# manifest.json included, is packed and encrypted, then deleted from disk --
-# nothing about this backup (contents, file names, categories, even that it
-# came from this host) is readable without the passphrase. Built outside
-# snapDir so tar isn't asked to archive its own in-progress output file
-# (harmless but noisy: "archive cannot contain itself").
-payloadTar=$(mktemp)
-if ! ( cd "$snapDir" && tar -cf "$payloadTar" . ); then
-  rm -f "$payloadTar"
-  passphrase=""
+# ---- Encrypt, entirely within the private scratch dir. There is no
+# plain-text mode: everything built above, manifest.json included, is
+# packed and encrypted. payloadTar is built inside the same tmpfs scratch
+# dir (not ambient /tmp, which may not be RAM-backed) via a name that
+# can't collide with anything real, then removed by the trap along with
+# everything else once the destination has the final encrypted blob.
+payloadTar="$snapDir/.payload.tar"
+if ! ( cd "$snapDir" && tar --exclude=.payload.tar -cf "$payloadTar" . ); then
   fail "Could not package the backup for encryption."
 fi
 
-gpgErr=$(mktemp)
+mkdir -p "$finalDir" || fail "Could not create $finalDir on the destination."
+
+gpgErr="$snapDir/.gpg-err"
 if ! printf '%s' "$passphrase" | gpg --batch --yes --passphrase-fd 0 --pinentry-mode loopback \
-    --symmetric --cipher-algo AES256 -o "$snapDir/payload.tar.gpg" "$payloadTar" 2>"$gpgErr"; then
+    --symmetric --cipher-algo AES256 -o "$finalDir/payload.tar.gpg" "$payloadTar" 2>"$gpgErr"; then
   errMsg=$(tail -n2 "$gpgErr" 2>/dev/null)
-  rm -f "$gpgErr" "$payloadTar" "$snapDir/payload.tar.gpg"
-  passphrase=""
+  rm -f "$finalDir/payload.tar.gpg"
   fail "Encryption failed: ${errMsg:-gpg error}"
 fi
-rm -f "$gpgErr" "$payloadTar"
-passphrase=""
 
-# Everything is now duplicated inside payload.tar.gpg -- drop every
-# plaintext original, keeping only the encrypted blob itself.
-find "$snapDir" -mindepth 1 -maxdepth 1 ! -name payload.tar.gpg -exec rm -rf {} +
+# scratchDir (plaintext snapDir, payloadTar, gpgErr, everything) is removed
+# by the trap below on exit -- nothing plaintext was ever written to the
+# destination at any point, only the encrypted blob just above.
 
 jq -n \
-  --arg path "$snapDir" \
+  --arg path "$finalDir" \
   --argjson categories "$categoriesJson" \
   --argjson totalFiles "$totalFiles" \
   --argjson totalBytes "$totalBytes" \
