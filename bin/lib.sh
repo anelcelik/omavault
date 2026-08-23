@@ -91,3 +91,50 @@ is_text_file() {
 json_escape() {
   jq -Rn --arg s "$1" '$s'
 }
+
+# Hard ceiling for a decrypted/staged config backup. Real backups are
+# KB-MB (text config only, binaries are excluded); this is generous
+# headroom, not a target -- see decrypt-snapshot.sh for how it's enforced
+# as an actual producer-side write limit, not just a post-hoc check.
+MAX_BACKUP_BYTES=$((128 * 1024 * 1024)) # 128 MiB
+
+# Resolves $XDG_RUNTIME_DIR to a scratch base we actually trust to be
+# private and memory-backed, or fails. There is deliberately no fallback
+# to /tmp: /tmp is commonly disk-backed and not guaranteed private, so
+# silently degrading to it would put decrypted config contents (which can
+# include SSH configs, tokens baked into dotfiles, etc.) on durable
+# storage without ever telling the caller. On success prints the
+# directory to stdout and returns 0; on failure prints a one-line reason
+# to stdout (not stderr, so `x=$(verified_runtime_dir) || fail "$x"`
+# captures it directly) and returns 1.
+verified_runtime_dir() {
+  local dir="${XDG_RUNTIME_DIR:-}"
+  if [ -z "$dir" ]; then
+    echo "\$XDG_RUNTIME_DIR is not set"
+    return 1
+  fi
+  if [ ! -d "$dir" ]; then
+    echo "\$XDG_RUNTIME_DIR ($dir) does not exist"
+    return 1
+  fi
+  local owner mode fstype
+  owner=$(stat -c '%U' "$dir" 2>/dev/null)
+  if [ "$owner" != "$(id -un)" ]; then
+    echo "$dir is not owned by the current user"
+    return 1
+  fi
+  mode=$(stat -c '%a' "$dir" 2>/dev/null)
+  if [ "$mode" != "700" ]; then
+    echo "$dir is not private (mode ${mode:-unknown}, expected 700)"
+    return 1
+  fi
+  fstype=$(stat -f -c '%T' "$dir" 2>/dev/null)
+  case "$fstype" in
+    tmpfs|ramfs) ;;
+    *)
+      echo "$dir is not memory-backed (filesystem: ${fstype:-unknown})"
+      return 1
+      ;;
+  esac
+  printf '%s' "$dir"
+}

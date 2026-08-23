@@ -7,6 +7,7 @@
 # (manifest.json, README.txt, SHA256SUMS, config/, dotfiles/).
 set -u
 cd "$(dirname "${BASH_SOURCE[0]}")" || exit 1
+. ./lib.sh
 
 dir="${1:-}"
 fail() { jq -n --arg e "$1" '{ok:false, error:$e}'; exit 1; }
@@ -18,18 +19,29 @@ IFS= read -r passphrase
 [ -n "${passphrase:-}" ] || fail "No passphrase entered."
 
 # Memory-backed (tmpfs) location, not the USB stick or disk -- the
-# decrypted plaintext should never land on durable storage. Removed on
-# every exit path via the trap below, including an unexpected early exit,
-# so a botched decrypt can't leave plaintext sitting in tmpfs either.
-base="${XDG_RUNTIME_DIR:-/tmp}"
+# decrypted plaintext should never land on durable storage. Fail closed
+# rather than falling back to /tmp: /tmp is commonly disk-backed and not
+# guaranteed private. Removed on every exit path via the trap below,
+# including an unexpected early exit, so a botched decrypt can't leave
+# plaintext sitting in tmpfs either.
+base=$(verified_runtime_dir) || fail "Refusing to decrypt: $base"
 tmpDir=$(mktemp -d "$base/omavault-decrypt-XXXXXX") || fail "Could not create a temp folder."
 chmod 700 "$tmpDir"
 trap 'passphrase=""; rm -rf "$tmpDir"' EXIT
 
+# ---- Bound gpg's own output, not just what we check afterward. A
+# hostile .gpg file can decompress to far more than its on-disk size (a
+# compression bomb) -- without this, gpg would happily write the entire
+# expanded payload to $tmpDir/.payload.tar before the totalBytes check
+# below ever runs, exhausting the tmpfs (and the runtime's memory) first.
+# `ulimit -f` is a producer-side, kernel-enforced cap on this subshell (so
+# it hits gpg's own writes) in 512-byte blocks: gpg gets SIGXFSZ/EFBIG and
+# stops the moment it crosses MAX_BACKUP_BYTES, well before that.
 gpgErr="$tmpDir/.gpg-err"
-if ! printf '%s' "$passphrase" | gpg --batch --yes --passphrase-fd 0 --pinentry-mode loopback \
-    -d "$dir/payload.tar.gpg" >"$tmpDir/.payload.tar" 2>"$gpgErr"; then
-  fail "Wrong passphrase, or this backup is corrupted."
+if ! ( ulimit -f $((MAX_BACKUP_BYTES / 512))
+       printf '%s' "$passphrase" | gpg --batch --yes --passphrase-fd 0 --pinentry-mode loopback \
+         -d "$dir/payload.tar.gpg" >"$tmpDir/.payload.tar" 2>"$gpgErr" ); then
+  fail "Wrong passphrase, this backup is corrupted, or the decrypted archive exceeds the $((MAX_BACKUP_BYTES / 1024 / 1024)) MiB limit for a config backup."
 fi
 passphrase=""
 
@@ -48,9 +60,12 @@ while IFS= read -r entry; do
   esac
 done < <(tar -tf "$tmpDir/.payload.tar" 2>/dev/null)
 
-maxBytes=$((2 * 1024 * 1024 * 1024)) # 2 GiB -- generous for a config backup
+# Belt-and-suspenders on top of the ulimit above: the ulimit already
+# bounds .payload.tar itself to MAX_BACKUP_BYTES, so this can only ever
+# trip on a malformed/inconsistent tar (it doesn't rely on the ulimit
+# having fired correctly).
 totalBytes=$(tar -tvf "$tmpDir/.payload.tar" 2>/dev/null | awk '{s+=$3} END{print s+0}')
-if [ "$totalBytes" -gt "$maxBytes" ]; then
+if [ "$totalBytes" -gt "$MAX_BACKUP_BYTES" ]; then
   fail "Backup rejected: archive is implausibly large ($totalBytes bytes) for a config backup."
 fi
 

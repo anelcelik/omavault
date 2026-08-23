@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.anelcelik.omavault",
   "name": "OmaVault",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "author": "anel",
   "license": "MIT",
   "description": "Back up your Omarchy settings, Hyprland config, terminal configs and installed plugins as an AES-256 encrypted, checksummed folder tree you can carry on a USB stick and restore on a fresh machine. A password is required every time -- there is no plain-text option.",

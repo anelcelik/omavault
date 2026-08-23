@@ -41,8 +41,11 @@ fi
 # never on the destination. mode 700, and removed on every exit path via
 # the trap below -- including a mid-run failure, so a botched export can't
 # leave plaintext sitting around either here or (since we never write
-# there until the very end) on the destination.
-scratchBase="${XDG_RUNTIME_DIR:-/tmp}"
+# there until the very end) on the destination. Fail closed rather than
+# falling back to /tmp: /tmp is commonly disk-backed and not guaranteed
+# private, so silently degrading to it would put plaintext config
+# contents on durable storage without ever telling the caller.
+scratchBase=$(verified_runtime_dir) || fail "Refusing to export: $scratchBase"
 snapDir=$(mktemp -d "$scratchBase/omavault-export-XXXXXX") || fail "Could not create a private scratch directory."
 chmod 700 "$snapDir"
 trap 'passphrase=""; rm -rf "$snapDir"' EXIT
