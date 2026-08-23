@@ -5,7 +5,7 @@
   "version": "1.0.0",
   "author": "anel",
   "license": "MIT",
-  "description": "Back up your Omarchy settings, Hyprland config, terminal configs and installed plugins as a plain, human-readable folder tree you can carry on a USB stick and restore on a fresh machine. Nothing is compressed or encrypted -- every file stays individually inspectable.",
+  "description": "Back up your Omarchy settings, Hyprland config, terminal configs and installed plugins as an AES-256 encrypted, checksummed folder tree you can carry on a USB stick and restore on a fresh machine. A password is required every time -- there is no plain-text option.",
   "kinds": [
     "bar-widget"
   ],
@@ -14,7 +14,7 @@
   },
   "barWidget": {
     "displayName": "OmaVault",
-    "description": "Export/import your Omarchy setup to/from a USB stick as plain text.",
+    "description": "Export/import your Omarchy setup to/from a USB stick, encrypted with a required password.",
     "category": "Compositor",
     "aliases": ["backup", "restore", "vault", "export", "import"],
     "allowMultiple": false,
