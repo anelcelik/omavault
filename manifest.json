@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.anelcelik.omavault",
+  "name": "OmaVault",
+  "version": "1.0.0",
+  "author": "anel",
+  "license": "MIT",
+  "description": "Back up your Omarchy settings, Hyprland config, terminal configs and installed plugins as a plain, human-readable folder tree you can carry on a USB stick and restore on a fresh machine. Nothing is compressed or encrypted -- every file stays individually inspectable.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "OmaVault.qml"
+  },
+  "barWidget": {
+    "displayName": "OmaVault",
+    "description": "Export/import your Omarchy setup to/from a USB stick as plain text.",
+    "category": "Compositor",
+    "aliases": ["backup", "restore", "vault", "export", "import"],
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

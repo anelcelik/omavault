@@ -1,0 +1,3 @@
+# Local dev/test cruft, not part of the plugin.
+*.log
+.DS_Store
