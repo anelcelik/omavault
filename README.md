@@ -5,6 +5,15 @@ plugins, Hyprland config, terminal configs, and (opt-in) shell/editor
 dotfiles -- to a folder tree, typically a USB stick, and restore it on a
 fresh Omarchy install. Click the teal **OV** chip on the bar.
 
+<p align="center">
+  <img src="screenshots/export-tab.png" width="46%" alt="Export tab: category checklist, destination picker, required passphrase fields">
+  <img src="screenshots/import-locked.png" width="46%" alt="Import tab: a detected backup, locked, waiting for its passphrase">
+</p>
+
+*(Mockups reproduced from the actual popup's QML/copy to illustrate the
+layout -- not raw screen captures. Real file counts/sizes/drive names will
+differ on your machine.)*
+
 ## Install
 
 ```
