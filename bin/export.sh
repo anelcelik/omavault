@@ -48,7 +48,12 @@ while IFS=$'\t' read -r id label _desc _def; do catLabel["$id"]="$label"; done <
 # cheap read-only dry-run scan is enough: nothing gets written until this
 # passes. Mirrors list-categories.sh's estimate technique (same dry-run
 # rsync --stats trick, same name-based excludes) so the number checked
-# here matches what a real export would actually try to copy.
+# here matches what a real export would actually try to copy -- --copy-links
+# in particular has to match the real copy step below (also --copy-links)
+# exactly: without it here, this dry-run would measure a symlink as just
+# the link itself (tiny), while the real copy dereferences it and stages
+# whatever it actually points to -- letting a small symlink to a huge
+# file or tree pass this gate and then blow up staging anyway.
 projectedBytes=0
 for id in "${catIds[@]}"; do
   [ -n "$id" ] || continue
@@ -63,7 +68,7 @@ for id in "${catIds[@]}"; do
       # rsync or an unparseable stats line falling back to "0 bytes"
       # would let an actually-oversized category slip straight through
       # this gate instead of being caught by it.
-      if ! stats=$(rsync -a --dry-run --stats "${BINARY_RSYNC_EXCLUDES[@]}" $extraExclude "$src/" /tmp/omavault-count-target-unused/ 2>/dev/null); then
+      if ! stats=$(rsync -a --copy-links --dry-run --stats "${BINARY_RSYNC_EXCLUDES[@]}" $extraExclude "$src/" /tmp/omavault-count-target-unused/ 2>/dev/null); then
         fail "Could not estimate the size of \"$rel\" -- refusing to export without a reliable size check."
       fi
       b=$(awk -F': ' '/Total transferred file size/ {gsub(/[, bytes]/,"",$2); print $2}' <<<"$stats")
@@ -122,7 +127,19 @@ for id in "${catIds[@]}"; do
     if [ "$kind" = "file" ]; then
       mkdir -p "$(dirname "$target")"
       if is_text_file "$src"; then
-        cp -p -- "$src" "$target" && { catFiles=$((catFiles + 1)); catBytes=$((catBytes + $(stat -c%s -- "$src" 2>/dev/null || echo 0))); }
+        # Producer-bound, not just preflight-checked: `cp` dereferences a
+        # symlink source by default too, so a dotfile that's actually a
+        # symlink to something huge would otherwise be copied in full
+        # before anything downstream could object. `ulimit -f` is a
+        # kernel-enforced per-file cap on this subshell's own writes --
+        # cp gets SIGXFSZ/EFBIG and stops the instant it crosses
+        # MAX_BACKUP_BYTES, the same producer-bound pattern used for
+        # gpg in decrypt-snapshot.sh.
+        if ( ulimit -f $((MAX_BACKUP_BYTES / 512)); cp -p -- "$src" "$target" ); then
+          catFiles=$((catFiles + 1)); catBytes=$((catBytes + $(stat -c%s -- "$src" 2>/dev/null || echo 0)))
+        else
+          fail "Could not stage \"$rel\" -- it may exceed the $((MAX_BACKUP_BYTES / 1024 / 1024)) MiB per-file limit for a config backup (a symlink to something unexpectedly large?)."
+        fi
       else
         skippedList+=("$rel (source: $src)")
       fi
@@ -135,10 +152,21 @@ for id in "${catIds[@]}"; do
       # symlinked dotfile setup (e.g. stow-managed configs) would silently
       # produce a backup that's entirely useless the moment someone tries
       # to restore it -- the worst possible time to find out.
+      #
+      # Wrapped in the same producer-bound ulimit as the "file" branch
+      # above: this caps any *single* file rsync writes (so one symlink
+      # dereferenced into one huge file can't blow up tmpfs on its own),
+      # while the projectedBytes preflight and the totalBytes re-check
+      # after this loop (using --copy-links-matched semantics and real
+      # post-copy byte counts respectively) cover the cumulative case of
+      # many smaller files adding up past the cap. Rsync failing for any
+      # reason (including hitting this cap) stays a soft per-category
+      # error, same as before -- the size gate that actually matters is
+      # the authoritative one below, checked against what's really there.
       rsyncFlags=(-a --copy-links "${BINARY_RSYNC_EXCLUDES[@]}")
       [ -n "$extraExclude" ] && rsyncFlags+=($extraExclude)
       [ "$mode" = "latest" ] && rsyncFlags+=(--delete)
-      if ! rsync "${rsyncFlags[@]}" "$src/" "$target/" 2>"$rsyncErrFile"; then
+      if ! ( ulimit -f $((MAX_BACKUP_BYTES / 512)); rsync "${rsyncFlags[@]}" "$src/" "$target/" ) 2>"$rsyncErrFile"; then
         errors+=("$label: rsync failed -- $(cat "$rsyncErrFile" 2>/dev/null | tail -n1)")
       fi
       rm -f "$rsyncErrFile"
@@ -167,7 +195,14 @@ while IFS= read -r -d '' f; do
 done < <(find "$snapDir" -type f -print0)
 
 # Drop directories left empty by the binary-stripping pass above.
-find "$snapDir" -type d -empty -delete 2>/dev/null
+# -mindepth 1: without it, GNU find's post-order -delete can cascade all
+# the way up to $snapDir itself once every subdirectory under it is
+# empty too (e.g. every selected category ended up filtered out, or was
+# nothing but a since-dereferenced-away symlink) -- silently deleting the
+# scratch dir this whole script still needs for README.txt/manifest.json/
+# SHA256SUMS/the tar right below, turning a clean "nothing to back up"
+# case into a confusing "No such file or directory" chain instead.
+find "$snapDir" -mindepth 1 -type d -empty -delete 2>/dev/null
 
 # Recompute real file counts per category now that binaries are stripped.
 categoriesJson=$(jq -c '.[]' <<<"$categoriesJson" | while read -r c; do
@@ -190,6 +225,20 @@ done | jq -s '.')
 
 totalFiles=$(jq '[.[].fileCount] | add // 0' <<<"$categoriesJson")
 totalBytes=$(jq '[.[].bytes] | add // 0' <<<"$categoriesJson")
+
+# ---- Authoritative size check against what's actually sitting in
+# tmpfs now, not an estimate -- the projectedBytes preflight above and
+# the per-file ulimit during copying both reduce how this can be
+# exceeded, but neither is a cumulative guarantee on its own (the
+# preflight can still race a source that grows after it's measured; the
+# ulimit only bounds any one file, not a tree of many small ones adding
+# up). This is real `find`-measured bytes of what got staged, checked
+# before anything is packed and encrypted, so a mismatch that slipped
+# past both earlier layers still gets caught here -- and cleaned up by
+# the trap -- instead of shipping a backup that was staged over budget.
+if [ "$totalBytes" -gt "$MAX_BACKUP_BYTES" ]; then
+  fail "Staged backup came to $totalBytes bytes, over the $((MAX_BACKUP_BYTES / 1024 / 1024)) MiB limit for a config backup -- deselect some categories."
+fi
 
 # ---- README.txt: human-readable even without the plugin installed ----
 {
