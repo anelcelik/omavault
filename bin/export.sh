@@ -107,7 +107,18 @@ finalDir="$vaultRoot/$snapName"
 categoriesJson="[]"
 skippedList=()
 errors=()
-rsyncErrFile="$snapDir/.rsync-err"
+
+# ---- Real, cumulative bytes actually written to $snapDir so far, updated
+# as staging happens (not just checked once after the whole loop below
+# finishes). The preflight above and the per-file ulimit caps during
+# copying each close one gap, but neither bounds the *aggregate*: many
+# files that each individually pass ulimit can still sum past
+# MAX_BACKUP_BYTES while still mid-copy, and a source tree or symlink
+# target swapped out right after preflight would only be caught once
+# everything downstream of it had already been written to tmpfs. This
+# counter is what lets both branches below fail the instant the running
+# total crosses the cap, instead of only once the whole loop returns.
+stagedBytes=0
 
 for id in "${catIds[@]}"; do
   [ -n "$id" ] || continue
@@ -136,7 +147,18 @@ for id in "${catIds[@]}"; do
         # MAX_BACKUP_BYTES, the same producer-bound pattern used for
         # gpg in decrypt-snapshot.sh.
         if ( ulimit -f $((MAX_BACKUP_BYTES / 512)); cp -p -- "$src" "$target" ); then
-          catFiles=$((catFiles + 1)); catBytes=$((catBytes + $(stat -c%s -- "$src" 2>/dev/null || echo 0)))
+          sz=$(stat -c%s -- "$src" 2>/dev/null || echo 0)
+          catFiles=$((catFiles + 1)); catBytes=$((catBytes + sz))
+          # Cumulative check right here, not just this one file's own
+          # ulimit cap: this "file" branch only ever handles a handful of
+          # dotfiles per export, but each one individually passing its own
+          # per-file cap says nothing about their sum. stagedBytes carries
+          # real bytes written across every category so far, so this
+          # catches the aggregate the moment it's crossed.
+          stagedBytes=$((stagedBytes + sz))
+          if [ "$stagedBytes" -gt "$MAX_BACKUP_BYTES" ]; then
+            fail "Staging exceeded the $((MAX_BACKUP_BYTES / 1024 / 1024)) MiB limit for a config backup while copying \"$rel\" -- deselect some categories."
+          fi
         else
           fail "Could not stage \"$rel\" -- it may exceed the $((MAX_BACKUP_BYTES / 1024 / 1024)) MiB per-file limit for a config backup (a symlink to something unexpectedly large?)."
         fi
@@ -152,24 +174,63 @@ for id in "${catIds[@]}"; do
       # symlinked dotfile setup (e.g. stow-managed configs) would silently
       # produce a backup that's entirely useless the moment someone tries
       # to restore it -- the worst possible time to find out.
-      #
-      # Wrapped in the same producer-bound ulimit as the "file" branch
-      # above: this caps any *single* file rsync writes (so one symlink
-      # dereferenced into one huge file can't blow up tmpfs on its own),
-      # while the projectedBytes preflight and the totalBytes re-check
-      # after this loop (using --copy-links-matched semantics and real
-      # post-copy byte counts respectively) cover the cumulative case of
-      # many smaller files adding up past the cap. Rsync failing for any
-      # reason (including hitting this cap) stays a soft per-category
-      # error, same as before -- the size gate that actually matters is
-      # the authoritative one below, checked against what's really there.
       rsyncFlags=(-a --copy-links "${BINARY_RSYNC_EXCLUDES[@]}")
       [ -n "$extraExclude" ] && rsyncFlags+=($extraExclude)
       [ "$mode" = "latest" ] && rsyncFlags+=(--delete)
-      if ! ( ulimit -f $((MAX_BACKUP_BYTES / 512)); rsync "${rsyncFlags[@]}" "$src/" "$target/" ) 2>"$rsyncErrFile"; then
-        errors+=("$label: rsync failed -- $(cat "$rsyncErrFile" 2>/dev/null | tail -n1)")
+      # ---- Staged one file at a time, with stagedBytes checked after
+      # every single one -- not one bulk rsync call left to run to
+      # completion and checked afterward (that was the actual gap: a
+      # background rsync polled from *outside* it can finish writing an
+      # entire tree of small sub-cap files faster than any poll interval
+      # can observe -- measured at 400 files/27MB in ~0.12s on tmpfs, well
+      # under even a tight poll tick -- so a "run it, then poll it"
+      # approach was tried here and confirmed unable to catch a fast local
+      # copy before the whole aggregate had already landed). Checking
+      # synchronously, in the same loop that performs each write, is the
+      # only way to guarantee the cap is seen before the next file starts.
+      #
+      # rsync still owns the file *enumeration* -- a --dry-run pass with
+      # --out-format emits exactly the (itemize-code, size, relative path)
+      # triples the real transfer would produce, so the exclude patterns
+      # and --copy-links dereferencing stay byte-for-byte the same as
+      # before; nothing here re-implements rsync's filter matching. %l is
+      # already the *post-dereference* size for a symlink source, matching
+      # what a real copy would actually write.
+      dryRunErr="$snapDir/.rsync-dryrun-err"
+      if ! dryRunOut=$(rsync "${rsyncFlags[@]}" --dry-run --out-format='%i,%l,%n' "$src/" "$target/" 2>"$dryRunErr"); then
+        errors+=("$label: rsync failed -- $(cat "$dryRunErr" 2>/dev/null | tail -n1)")
+      else
+        while IFS=',' read -r itemize _size fname; do
+          [ -z "$fname" ] && continue
+          # Only regular-file transfer lines (itemize starts ">f"); skip
+          # directory-create lines ("cd...") and anything else rsync's
+          # --out-format can emit -- mkdir -p below handles directories.
+          case "$itemize" in
+            '>f'*) ;;
+            *) continue ;;
+          esac
+          ftarget="$target/$fname"
+          fsrc="$src/$fname"
+          mkdir -p "$(dirname "$ftarget")"
+          # Same producer-bound ulimit as the "file" branch above: caps
+          # this one file's own write (a dereferenced symlink to
+          # something unexpectedly huge can't blow past the cap on its
+          # own), while the stagedBytes check right after bounds the
+          # running sum across every file staged so far, in every
+          # category -- the actual cumulative gate.
+          if ( ulimit -f $((MAX_BACKUP_BYTES / 512)); cp -p -- "$fsrc" "$ftarget" ) 2>/dev/null; then
+            sz=$(stat -c%s -- "$ftarget" 2>/dev/null || echo 0)
+            catFiles=$((catFiles + 1)); catBytes=$((catBytes + sz))
+            stagedBytes=$((stagedBytes + sz))
+            if [ "$stagedBytes" -gt "$MAX_BACKUP_BYTES" ]; then
+              fail "Staging exceeded the $((MAX_BACKUP_BYTES / 1024 / 1024)) MiB limit for a config backup while copying \"$rel/$fname\" -- deselect some categories."
+            fi
+          else
+            errors+=("$label: could not stage \"$fname\" (source: $fsrc)")
+          fi
+        done <<<"$dryRunOut"
       fi
-      rm -f "$rsyncErrFile"
+      rm -f "$dryRunErr"
     fi
   done < <(category_entries "$id")
 
@@ -227,15 +288,16 @@ totalFiles=$(jq '[.[].fileCount] | add // 0' <<<"$categoriesJson")
 totalBytes=$(jq '[.[].bytes] | add // 0' <<<"$categoriesJson")
 
 # ---- Authoritative size check against what's actually sitting in
-# tmpfs now, not an estimate -- the projectedBytes preflight above and
-# the per-file ulimit during copying both reduce how this can be
-# exceeded, but neither is a cumulative guarantee on its own (the
-# preflight can still race a source that grows after it's measured; the
-# ulimit only bounds any one file, not a tree of many small ones adding
-# up). This is real `find`-measured bytes of what got staged, checked
-# before anything is packed and encrypted, so a mismatch that slipped
-# past both earlier layers still gets caught here -- and cleaned up by
-# the trap -- instead of shipping a backup that was staged over budget.
+# tmpfs now, not an estimate. The projectedBytes preflight, the per-file
+# ulimit during copying, and the stagedBytes cumulative gate enforced
+# live during the copy loop above each close one layer of this -- but
+# this is still the final backstop: it's real `find`-measured bytes of
+# what actually got staged, checked once more right before anything is
+# packed and encrypted, so even a discrepancy from the binary-stripping
+# pass just above (which removes files after the cumulative gate already
+# counted them, so it can only ever push totalBytes down, never up) is
+# caught here rather than assumed. Belt-and-suspenders, not the only
+# guard -- but nothing gets packed without passing it regardless.
 if [ "$totalBytes" -gt "$MAX_BACKUP_BYTES" ]; then
   fail "Staged backup came to $totalBytes bytes, over the $((MAX_BACKUP_BYTES / 1024 / 1024)) MiB limit for a config backup -- deselect some categories."
 fi
