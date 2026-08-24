@@ -14,6 +14,14 @@ catsArg="${2:-}"
 
 fail() { jq -n --arg e "$1" '{ok:false, error:$e}'; exit 1; }
 
+# Relative-path listing files, one per dir-kind category entry, built once
+# below (before checksum verification) and reused as-is for the actual
+# restore copy further down -- see the comment at dirFileList[] for why.
+# Never holds real snapshot content, only filenames, but cleaned up on
+# every exit path regardless.
+listTmpFiles=()
+trap 'rm -f "${listTmpFiles[@]:-}"' EXIT
+
 [ -n "$snapDir" ] && [ -d "$snapDir" ] || fail "Snapshot folder not found."
 [ -f "$snapDir/manifest.json" ] || fail "No manifest.json -- not an OmaVault snapshot."
 [ -n "$catsArg" ] || fail "No categories selected."
@@ -58,17 +66,43 @@ for id in "${catIds[@]}"; do
 done
 
 # ---- Scope checksum verification to just the files we're about to touch.
+# For a "dir" entry, the list is built with an rsync --dry-run against a
+# throwaway *empty* directory -- never the real destination -- and that
+# same list is what actually drives the restore copy further down (via
+# --files-from), instead of the copy loop doing its own independent
+# `find`/rsync walk of $snapSrc that's merely assumed to still agree with
+# what got verified here. Two independent walks of the same directory
+# can drift (a file added to $snapDir between them would be restored
+# without ever having been checksum-verified) -- one captured list, reused
+# unmodified for both verification and copy, can't drift by construction.
+# Listing against the real destination instead of an empty throwaway would
+# introduce a *different* version of the same bug: rsync's own delta-skip
+# silently omits any file already identical at the destination, which
+# would silently drop it from checksum coverage too (confirmed directly:
+# a file already in place at the destination vanishes from the listing
+# the moment the dest is used instead of an empty dir).
 relFiles=()
+declare -A dirFileList
 for id in "${catIds[@]}"; do
   [ -n "$id" ] || continue
-  while IFS=$'\t' read -r src rel kind _ex; do
+  while IFS=$'\t' read -r src rel kind extraExclude; do
     [ -z "$rel" ] && continue
     if [ "$kind" = "file" ]; then
       [ -f "$snapDir/$rel" ] && relFiles+=("$rel")
     else
-      while IFS= read -r -d '' f; do
-        relFiles+=("${f#"$snapDir"/}")
-      done < <(find "$snapDir/$rel" -type f -print0 2>/dev/null)
+      [ -d "$snapDir/$rel" ] || continue
+      listDest=$(mktemp -d) && listTmpFiles+=("$listDest")
+      listFile=$(mktemp) && listTmpFiles+=("$listFile")
+      listFlags=(-rptgo)
+      [ -n "$extraExclude" ] && listFlags+=($extraExclude)
+      while IFS=',' read -r itemize fname; do
+        [ -z "$fname" ] && continue
+        case "$itemize" in '>f'*) ;; *) continue ;; esac
+        printf '%s\n' "$fname" >>"$listFile"
+        relFiles+=("$rel/$fname")
+      done < <(rsync "${listFlags[@]}" --dry-run --out-format='%i,%n' "$snapDir/$rel/" "$listDest/" 2>/dev/null)
+      rmdir "$listDest" 2>/dev/null
+      dirFileList["$rel"]="$listFile"
     fi
   done < <(category_entries "$id")
 done
@@ -157,11 +191,13 @@ for id in "${catIds[@]}"; do
         cp -a -- "$src" "$backupDir/$rel"
       fi
       mkdir -p "$src"
-      # Same extraExclude as export.sh (e.g. "core" excluding its nested
-      # /plugins subfolder) -- without this, restoring "core" alone would
-      # also drag in files that only belong to a separate category the
-      # user may not have selected (they're physically nested in the
-      # snapshot when both categories were exported together).
+      # --files-from fed the exact list captured (and checksum-verified)
+      # above, not a fresh independent walk of $snapSrc -- extraExclude
+      # (e.g. "core" excluding its nested /plugins subfolder) was already
+      # applied when that list was built, so it doesn't need repeating
+      # here, and nothing can reach this copy without having gone through
+      # verification: the file sets are the same list, not two walks
+      # hoped to agree.
       # -rptgo, not -a: -a implies -l (preserve symlinks as symlinks) and
       # -D (devices/specials). The type-check above already guarantees
       # nothing but regular files/directories exist under $snapSrc -- this
@@ -172,10 +208,11 @@ for id in "${catIds[@]}"; do
       # earlier pass) skips any non-regular entry at the moment it
       # actually reads $snapSrc, so a swap-in right before this call is
       # simply skipped rather than followed or recreated.
-      rsyncFlags=(-r -p -t -g -o)
-      [ -n "$extraExclude" ] && rsyncFlags+=($extraExclude)
-      rsync "${rsyncFlags[@]}" "$snapSrc/" "$src/" 2>/dev/null
-      files=$((files + $(find "$snapSrc" -type f | wc -l)))
+      listFile="${dirFileList[$rel]:-}"
+      if [ -n "$listFile" ] && [ -s "$listFile" ]; then
+        rsync -rptgo --files-from="$listFile" "$snapSrc/" "$src/" 2>/dev/null
+        files=$((files + $(grep -c . "$listFile" 2>/dev/null || echo 0)))
+      fi
     fi
   done < <(category_entries "$id")
   categoriesJson=$(jq --arg id "$id" --arg label "$label" --argjson f "$files" '. + [{id:$id, label:$label, fileCount:$f}]' <<<"$categoriesJson")
