@@ -370,14 +370,51 @@ if ! ( cd "$snapDir" && tar --exclude=.payload.tar -cf "$payloadTar" . ); then
   fail "Could not package the backup for encryption."
 fi
 
+# ---- finalDir/finalFile are predictable paths (omavault/latest or
+# omavault/snapshot-<timestamp>), so a pre-existing symlink planted at
+# either one must never be followed: gpg's own -o open (no O_EXCL) and a
+# naive mkdir -p would both happily write/truncate through it into
+# whatever real file or directory the symlink points at. Fail closed on
+# any such unexpected target rather than silently walking through it.
+[ -L "$finalDir" ] && fail "Refusing to export: $finalDir is a symlink, not a real backup directory."
 mkdir -p "$finalDir" || fail "Could not create $finalDir on the destination."
+
+finalFile="$finalDir/payload.tar.gpg"
+if [ -L "$finalFile" ]; then
+  fail "Refusing to export: $finalFile is a symlink -- will not write through it."
+elif [ -e "$finalFile" ] && [ ! -f "$finalFile" ]; then
+  fail "Refusing to export: $finalFile already exists and is not a plain file."
+fi
+# A pre-existing plain file here (mode=latest overwriting last time's
+# payload.tar.gpg) is expected and fine -- it gets replaced atomically by
+# the rename below, not written through in place.
+
+# Write the encrypted blob to a freshly, exclusively created random
+# sibling first (its name is unguessable, so nothing could have
+# pre-planted a symlink at it), validate what gpg actually produced, and
+# only then atomically rename it onto finalFile. rename(2) never follows
+# a destination symlink -- it replaces whatever directory entry is there
+# -- so even if finalFile were re-swapped for a symlink in the instant
+# between the checks above and this rename, the symlink itself would be
+# unlinked and replaced, never written through.
+tmpOut=$(mktemp "$finalDir/.payload.tar.gpg.XXXXXX") || fail "Could not create a temporary output file on the destination."
 
 gpgErr="$snapDir/.gpg-err"
 if ! printf '%s' "$passphrase" | gpg --batch --yes --passphrase-fd 0 --pinentry-mode loopback \
-    --symmetric --cipher-algo AES256 -o "$finalDir/payload.tar.gpg" "$payloadTar" 2>"$gpgErr"; then
+    --symmetric --cipher-algo AES256 -o "$tmpOut" "$payloadTar" 2>"$gpgErr"; then
   errMsg=$(tail -n2 "$gpgErr" 2>/dev/null)
-  rm -f "$finalDir/payload.tar.gpg"
+  rm -f "$tmpOut"
   fail "Encryption failed: ${errMsg:-gpg error}"
+fi
+
+if [ -L "$tmpOut" ] || [ ! -f "$tmpOut" ] || [ ! -s "$tmpOut" ]; then
+  rm -f "$tmpOut"
+  fail "Encryption output looked wrong -- refusing to publish it."
+fi
+
+if ! mv -f -- "$tmpOut" "$finalFile"; then
+  rm -f "$tmpOut"
+  fail "Could not move the encrypted backup into place on the destination."
 fi
 
 # scratchDir (plaintext snapDir, payloadTar, gpgErr, everything) is removed
